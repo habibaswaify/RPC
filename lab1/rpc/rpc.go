@@ -196,41 +196,92 @@ func validateRequest(req request) error {
 // your chosen assignment protocol requires another result or argument rule.
 // invoke finds a method, converts JSON arguments to its parameter types, and calls it.
 func (s *Server) invoke(req request) (any, error) {
-	method := reflect.ValueOf(s.receiver).MethodByName(req.Method)
+	receiverVal := reflect.ValueOf(s.receiver)
+	receiverType := receiverVal.Type()
+
+	// 1. Verify the method exists on the receiver type and is explicitly exported.
+	// Go RPC specifications require that only exported (public) methods can be called remotely.
+	methodType, exists := receiverType.MethodByName(req.Method)
+	if !exists || !methodType.IsExported() {
+		return nil, fmt.Errorf("unknown method %q", req.Method)
+	}
+
+	// Retrieve the callable reflect.Value of the method.
+	method := receiverVal.MethodByName(req.Method)
 	if !method.IsValid() {
 		return nil, fmt.Errorf("unknown method %q", req.Method)
 	}
-	typeOfMethod := method.Type()
-	if typeOfMethod.NumIn() != len(req.Args) {
-		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, typeOfMethod.NumIn(), len(req.Args))
+
+	// 2. Validate return shapes against allowed protocol signatures:
+	// Supported shapes:
+	//   - 0 returns: func()
+	//   - 1 return (value or error): func() T  OR  func() error
+	//   - 2 returns (value, error): func() (T, error)
+	numOut := method.Type().NumOut()
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+
+	if numOut > 2 {
+		return nil, fmt.Errorf("method %q has unsupported return signature", req.Method)
 	}
+	if numOut == 2 && !method.Type().Out(1).Implements(errorType) {
+		return nil, fmt.Errorf("method %q second return value must be an error", req.Method)
+	}
+
+	// 3. Verify argument count matches method parameter count.
+	numIn := method.Type().NumIn()
+	if numIn != len(req.Args) {
+		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, numIn, len(req.Args))
+	}
+
+	// 4. Convert each raw JSON argument into the method's expected Go parameter type.
 	arguments := make([]reflect.Value, len(req.Args))
 	for index, raw := range req.Args {
-		argument := reflect.New(typeOfMethod.In(index))
-		if err := json.Unmarshal(raw, argument.Interface()); err != nil {
+		targetType := method.Type().In(index)
+
+		// reflect.New creates a pointer to a new zero value of targetType (*T).
+		// json.Unmarshal requires a pointer to write decoded data into.
+		argPtr := reflect.New(targetType)
+		if err := json.Unmarshal(raw, argPtr.Interface()); err != nil {
 			return nil, fmt.Errorf("argument %d: %v", index, err)
 		}
-		arguments[index] = argument.Elem()
+
+		// argPtr.Elem() dereferences *T back to T so it can be passed into method.Call.
+		arguments[index] = argPtr.Elem()
 	}
+
+	// 5. Safely invoke the method using reflection, catching any potential runtime panic.
 	outputs, err := callMethodSafely(method, arguments)
 	if err != nil {
 		return nil, err
 	}
+
+	// 6. Handle return values according to the supported shapes:
+	// Shape A: Void method (0 return values).
 	if len(outputs) == 0 {
 		return nil, nil
 	}
-	if last := outputs[len(outputs)-1]; last.Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+
+	// Shape B & C: Check if the last return value implements the Go error interface.
+	if last := outputs[len(outputs)-1]; last.Type().Implements(errorType) {
 		if !isNilValue(last) {
+			// Method returned an actual error; return it as a remote error to the client.
 			return nil, last.Interface().(error)
 		}
+		// Error was nil; trim it from outputs so we can process the primary return value.
 		outputs = outputs[:len(outputs)-1]
 	}
+
+	// If the method signature was func() error and the error was nil, outputs is now empty.
 	if len(outputs) == 0 {
 		return nil, nil
 	}
+
+	// Shape D: Return the primary result value.
 	return outputs[0].Interface(), nil
 }
 
+// isNilValue safely checks if a reflect.Value represents a nil reference.
+// Calling .IsNil() on non-pointer/non-reference types in Go triggers a runtime panic.
 func isNilValue(value reflect.Value) bool {
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
@@ -240,6 +291,8 @@ func isNilValue(value reflect.Value) bool {
 	}
 }
 
+// callMethodSafely invokes the reflect.Value method while recovering from any internal panic.
+// This prevents a panic in service code from crashing the RPC server process.
 func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs []reflect.Value, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -248,7 +301,6 @@ func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs 
 	}()
 	return method.Call(arguments), nil
 }
-
 // Client calls methods on a remote Server.
 type Client struct {
 	Address string
