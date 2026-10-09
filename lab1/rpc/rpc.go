@@ -57,20 +57,90 @@ func NewServer(receiver any) (*Server, error) {
 // and launch the accept loop without blocking the caller.
 // Start begins accepting remote calls at address. Use port 0 to request an available port.
 func (s *Server) Start(address string) error {
-	return errors.New("TODO: implement Server.Start")
+	// Set Mutex to prevent duplicate starts
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.listener != nil {
+		return errors.New("server is already running")
+	}
+
+	// Connect to tcp listener
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+
+	s.listener = listener
+	// allocate server lifecycle state
+	s.stopped = make(chan struct{})
+	s.acceptDone = make(chan struct{})
+
+	go s.acceptConnections(s.listener, s.stopped, s.acceptDone)
+
+	return nil
+}
+
+// background goroutine to accept connections
+func (s *Server) acceptConnections(listener net.Listener, stopped, done chan struct{}) {
+	defer close(done)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-stopped:
+				// pass , normal shutdown
+			default:
+				fmt.Println("accept:", err)
+			}
+			return
+
+		}
+		s.workers.Add(1)
+		go func(conn_ net.Conn) {
+			defer s.workers.Done()
+			s.handle(conn_)
+		}(conn)
+	}
+
 }
 
 // TODO 2: Return the listener address safely while allowing port 0 discovery.
 // Address returns the address assigned to the running server.
 func (s *Server) Address() string {
-	return ""
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil{
+		return ""
+	}
+
+	return s.listener.Addr().String()
 }
 
 // TODO 3: Close the listener, signal the accept loop, wait for its workers,
 // and leave the server in a state where Start can be called again.
 // Stop stops accepting new connections and waits for active handlers to finish.
 func (s *Server) Stop() error {
-	return errors.New("TODO: implement Server.Stop")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil{
+		// server never started or already stopped
+		return nil
+	}
+	// stop the accept loop
+	close(s.stopped)
+
+	err := s.listener.Close()
+	<- s.acceptDone // wait for the accept loop to end
+	// wait for active handler
+	s.workers.Wait()
+
+	// reset variables
+	s.listener = nil
+	s.stopped = nil
+	s.acceptDone = nil
+	
+	return  err
 }
 
 // TODO 4: Study this starter request handler, then complete and test the protocol
