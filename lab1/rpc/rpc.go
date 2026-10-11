@@ -11,6 +11,8 @@ import (
 	"reflect"
 	"sync"
 	"time"
+	"unicode"
+
 )
 
 const (
@@ -184,9 +186,40 @@ func (s *Server) handle(connection net.Conn) {
 // TODO 5: Reject empty or unsafe method names, too many arguments, arguments
 // larger than maxArgumentBytes, and requests larger than maxRequestBytes.
 // validateRequest rejects malformed or abusive requests before reflection runs.
+
+
 func validateRequest(req request) error {
-	return errors.New("TODO: implement validateRequest")
+	// Reject an empty method name.
+	if req.Method == "" {
+		return errors.New("method cannot be empty")
+	}
+
+	// Reject whitespace or control characters in the method name.
+	for _, r := range req.Method {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errors.New("method name contains whitespace or control characters")
+		}
+	}
+	if len(req.Args) > maxArguments {
+		return errors.New("too many arguments")
+	}
+	totalBytes := 0
+	for _, arg := range req.Args {
+		if len(arg) > maxArgumentBytes {
+			return errors.New("larger")
+		}
+
+		totalBytes += len(arg)
+
+		if totalBytes > maxRequestBytes {
+			return errors.New("larger")
+		}
+	}
+
+	return nil
 }
+
+
 
 // TODO 6: Study and test this starter reflection bridge. Your required work is to
 // support and test exported methods with zero arguments, typed arguments, no
@@ -318,6 +351,81 @@ func NewClient(address string) (*Client, error) {
 // TODO 7: Open one connection, apply a deadline, encode the request, read one
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
+
 func (c *Client) Call(method string, out any, args ...any) error {
-	return errors.New("TODO: implement Client.Call")
+	// Reject an empty method name.
+	if method == "" {
+		return errors.New("method name cannot be empty")
+	}
+
+	// Encode the arguments before opening the connection.
+	encodedArgs := make([]json.RawMessage, len(args))
+	for i, arg := range args {
+		data, err := json.Marshal(arg)
+		if err != nil {
+			return fmt.Errorf("encode argument %d: %w", i, err)
+		}
+
+		if len(data) > maxArgumentBytes {
+			return fmt.Errorf("argument %d exceeds maxArgumentBytes", i)
+		}
+
+		encodedArgs[i] = json.RawMessage(data)
+	}
+
+	// Encode the request.
+	req := request{
+		Method: method,
+		Args:   encodedArgs,
+	}
+
+	requestData, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+
+	if len(requestData) > maxRequestBytes {
+		return errors.New("request exceeds maxRequestBytes")
+	}
+
+	// Open one TCP connection with the configured timeout.
+	conn, err := net.DialTimeout("tcp", c.Address, c.Timeout)
+	if err != nil {
+		return fmt.Errorf("connect to server: %w", err)
+	}
+	defer conn.Close()
+
+	// Apply the configured timeout to connection I/O.
+	if err := conn.SetDeadline(time.Now().Add(c.Timeout)); err != nil {
+		return fmt.Errorf("set connection deadline: %w", err)
+	}
+
+	// Send exactly one JSON request.
+	if _, err := conn.Write(append(requestData, '\n')); err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+
+	// Read exactly one response.
+	var resp response
+	decoder := json.NewDecoder(conn)
+	if err := decoder.Decode(&resp); err != nil {
+		return fmt.Errorf("decode server response: %w", err)
+	}
+
+	// Return errors reported by the remote method.
+	if resp.Error != "" {
+		return fmt.Errorf("remote call failed: %s", resp.Error)
+	}
+
+	// No output is needed for methods without a result.
+	if out == nil {
+		return nil
+	}
+
+	// Decode the returned JSON value into the caller's output variable.
+	if err := json.Unmarshal(resp.Value, out); err != nil {
+		return fmt.Errorf("decode response value: %w", err)
+	}
+
+	return nil
 }
