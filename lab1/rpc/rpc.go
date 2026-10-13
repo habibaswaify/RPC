@@ -2,45 +2,46 @@
 package rpc
 
 import (
-	"bufio"
-	"encoding/json"
+	"bufio" //Buffers input while reading a connection.
+	"encoding/json" //Encodes and decodes JSON.
 	"errors"
-	"fmt"
-	"io"
-	"net"
-	"reflect"
-	"sync"
-	"time"
-	"unicode"
+	"fmt" //Formats error messages and output
+	"io" //Provides LimitReader to restrict how much input is read.
+	"net" //Provides TCP listeners and network connections
+	"reflect" //Finds methods and invokes them dynamically.
+	"sync" //Provides Mutex and WaitGroup for synchronization.
+	"time" //Sets timeouts and deadlines
+	"unicode" //Detects whitespace and control characters in method names
 
 )
 
 const (
 	maxArguments       = 8
-	maxArgumentBytes   = 1 << 20
-	maxRequestBytes    = 4 << 20
-	defaultCallTimeout = 5 * time.Second
+	maxArgumentBytes   = 1 << 20 
+	maxRequestBytes    = 4 << 20 //4*2^20
+	defaultCallTimeout = 5 * time.Second //Default time limit for a client call.
 )
 
 type request struct {
 	Method string            `json:"method"`
-	Args   []json.RawMessage `json:"args"`
+	Args   []json.RawMessage `json:"args"` //holds JSON data in its original encoded form until you decide how to decode it. ex add method needs 2 integers
 }
 
 type response struct {
 	OK    bool            `json:"ok"`
-	Value json.RawMessage `json:"value,omitempty"`
-	Error string          `json:"error,omitempty"`
+	Value json.RawMessage `json:"value,omitempty"` //omitempty allows empty fields to be left out.
+	Error string          `json:"error,omitempty"` //omit the field from the JSON output if its value is empty according to the JSON encoder's omission rules.
 }
 
 // Server exposes exported methods of a receiver over TCP.
 type Server struct {
 	receiver   any
-	listener   net.Listener
-	stopped    chan struct{}
-	acceptDone chan struct{}
-	workers    sync.WaitGroup
-	mu         sync.Mutex
+	listener   net.Listener //listens for TCP connections.
+	stopped    chan struct{} //A channel used to signal that the server is stopping.
+	acceptDone chan struct{} //A channel closed when the accept loop finishes.
+	workers    sync.WaitGroup //Counts active connection-handler goroutines
+	mu         sync.Mutex // Protects shared server state against concurrent access
+	// mutex to prevent simultaneous acccess to this shared state
 }
 
 // NewServer creates a server for a non-nil pointer receiver.
@@ -68,7 +69,7 @@ func (s *Server) Start(address string) error {
 	}
 
 	// Connect to tcp listener
-	listener, err := net.Listen("tcp", address)
+	listener, err := net.Listen("tcp", address) 
 	if err != nil {
 		return err
 	}
@@ -80,7 +81,7 @@ func (s *Server) Start(address string) error {
 
 	go s.acceptConnections(s.listener, s.stopped, s.acceptDone)
 
-	return nil
+	return nil // server opperation worked
 }
 
 // background goroutine to accept connections
@@ -110,7 +111,7 @@ func (s *Server) acceptConnections(listener net.Listener, stopped, done chan str
 // TODO 2: Return the listener address safely while allowing port 0 discovery.
 // Address returns the address assigned to the running server.
 func (s *Server) Address() string {
-	s.mu.Lock()
+	s.mu.Lock() //prevent data race w eno stop() t5aly el address nil feh nafs el w2t ely ana b2ra fe addres.string
 	defer s.mu.Unlock()
 	if s.listener == nil{
 		return ""
@@ -123,7 +124,7 @@ func (s *Server) Address() string {
 // and leave the server in a state where Start can be called again.
 // Stop stops accepting new connections and waits for active handlers to finish.
 func (s *Server) Stop() error {
-	s.mu.Lock()
+	s.mu.Lock() 
 	defer s.mu.Unlock()
 	if s.listener == nil{
 		// server never started or already stopped
@@ -151,18 +152,21 @@ func (s *Server) Stop() error {
 // leave a connection hanging. Connect this handler to your completed Start and
 // Stop lifecycle so each accepted connection is processed by a worker safely.
 // handle reads one request, invokes it, and writes one response.
-func (s *Server) handle(connection net.Conn) {
-	defer connection.Close()
-	encoder := json.NewEncoder(connection)
-	defer func() {
+func (s *Server) handle(connection net.Conn) { // it is task coming from client that the worker does it
+	// read -> checked the request -> did the method using invoke -> back to JSON -> resonse to client
+	defer connection.Close() // when the handle is finished we close the connection 
+	encoder := json.NewEncoder(connection) // from GO to JSON 
+	defer func() {// if a panic happened we send an error and recover() try to stop the panic from spreading through server so only this handler is crashed not all(server crash)
 		if recovered := recover(); recovered != nil {
 			_ = encoder.Encode(response{Error: fmt.Sprintf("remote method panicked: %v", recovered)})
 		}
 	}()
 
-	decoder := json.NewDecoder(bufio.NewReader(io.LimitReader(connection, maxRequestBytes+1)))
+	decoder := json.NewDecoder(bufio.NewReader(io.LimitReader(connection, maxRequestBytes+1))) //limits the bytes read from connection
+	// +1 to make sure it was really a big request not just a incompleted JSON 
+	// JSON to GO
 	var req request
-	if err := decoder.Decode(&req); err != nil {
+	if err := decoder.Decode(&req); err != nil { // we put the read info to varibale req and send a message if JSON input has a problem
 		_ = encoder.Encode(response{Error: fmt.Sprintf("invalid request: %v", err)})
 		return
 	}
@@ -175,12 +179,12 @@ func (s *Server) handle(connection net.Conn) {
 		_ = encoder.Encode(response{Error: err.Error()})
 		return
 	}
-	payload, err := json.Marshal(result)
+	payload, err := json.Marshal(result) // if the method worked we send back the result in JSON
 	if err != nil {
 		_ = encoder.Encode(response{Error: fmt.Sprintf("encode result: %v", err)})
 		return
 	}
-	_ = encoder.Encode(response{OK: true, Value: payload})
+	_ = encoder.Encode(response{OK: true, Value: payload}) // i send a respnse it succedded
 }
 
 // TODO 5: Reject empty or unsafe method names, too many arguments, arguments
@@ -232,7 +236,7 @@ func (s *Server) invoke(req request) (any, error) {
 	receiverVal := reflect.ValueOf(s.receiver)
 	receiverType := receiverVal.Type()
 
-	// 1. Verify the method exists on the receiver type and is explicitly exported.
+	// 1. Verify the method exists on the receiver type and is explicitly exported. // must be capital letter 
 	// Go RPC specifications require that only exported (public) methods can be called remotely.
 	methodType, exists := receiverType.MethodByName(req.Method)
 	if !exists || !methodType.IsExported() {
@@ -247,20 +251,20 @@ func (s *Server) invoke(req request) (any, error) {
 
 	// 2. Validate return shapes against allowed protocol signatures:
 	// Supported shapes:
-	//   - 0 returns: func()
-	//   - 1 return (value or error): func() T  OR  func() error
+	//   - 0 returns: func() // void
+	//   - 1 return (value or error): func() T  OR  func() error 
 	//   - 2 returns (value, error): func() (T, error)
 	numOut := method.Type().NumOut()
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
 
-	if numOut > 2 {
+	if numOut > 2 { //(int,string)
 		return nil, fmt.Errorf("method %q has unsupported return signature", req.Method)
 	}
 	if numOut == 2 && !method.Type().Out(1).Implements(errorType) {
 		return nil, fmt.Errorf("method %q second return value must be an error", req.Method)
 	}
 
-	// 3. Verify argument count matches method parameter count.
+	// 3. Verify argument count matches method parameter count. // if he forget one of the 2 argument required for method 
 	numIn := method.Type().NumIn()
 	if numIn != len(req.Args) {
 		return nil, fmt.Errorf("method %q expects %d arguments, got %d", req.Method, numIn, len(req.Args))
@@ -269,11 +273,11 @@ func (s *Server) invoke(req request) (any, error) {
 	// 4. Convert each raw JSON argument into the method's expected Go parameter type.
 	arguments := make([]reflect.Value, len(req.Args))
 	for index, raw := range req.Args {
-		targetType := method.Type().In(index)
+		targetType := method.Type().In(index) // byshof ana m7taga el output ykon ehh int wla string wla ehh
 
-		// reflect.New creates a pointer to a new zero value of targetType (*T).
-		// json.Unmarshal requires a pointer to write decoded data into.
-		argPtr := reflect.New(targetType)
+		// reflect.New : creates a pointer to a new zero value of targetType (*T).
+		// json.Unmarshal: requires a pointer to write decoded data into.
+		argPtr := reflect.New(targetType) 
 		if err := json.Unmarshal(raw, argPtr.Interface()); err != nil {
 			return nil, fmt.Errorf("argument %d: %v", index, err)
 		}
@@ -300,6 +304,7 @@ func (s *Server) invoke(req request) (any, error) {
 			// Method returned an actual error; return it as a remote error to the client.
 			return nil, last.Interface().(error)
 		}
+		//ex: func Add(a, b int) (int, error) {return a + b, nil} we return the int and ignore the error
 		// Error was nil; trim it from outputs so we can process the primary return value.
 		outputs = outputs[:len(outputs)-1]
 	}
@@ -309,7 +314,7 @@ func (s *Server) invoke(req request) (any, error) {
 		return nil, nil
 	}
 
-	// Shape D: Return the primary result value.
+	// Return the primary result value.
 	return outputs[0].Interface(), nil
 }
 
@@ -323,7 +328,7 @@ func isNilValue(value reflect.Value) bool {
 		return false
 	}
 }
-
+// call el by7sal lama nt2ked eno kol el attributes mafihash moshkela fel invoke w howa el bynafez el recover lama by7sal panic
 // callMethodSafely invokes the reflect.Value method while recovering from any internal panic.
 // This prevents a panic in service code from crashing the RPC server process.
 func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs []reflect.Value, err error) {
@@ -336,8 +341,8 @@ func callMethodSafely(method reflect.Value, arguments []reflect.Value) (outputs 
 }
 // Client calls methods on a remote Server.
 type Client struct {
-	Address string
-	Timeout time.Duration
+	Address string // sever address where the call is done to
+	Timeout time.Duration // max time till the call drops 
 }
 
 // NewClient creates a client for a server address.
@@ -352,14 +357,14 @@ func NewClient(address string) (*Client, error) {
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
 
-func (c *Client) Call(method string, out any, args ...any) error {
+func (c *Client) Call(method string, out any, args ...any) error { //err := client.Call("Add", &result, 3, 5)
 	// Reject an empty method name.
 	if method == "" {
 		return errors.New("method name cannot be empty")
 	}
 
-	// Encode the arguments before opening the connection.
-	encodedArgs := make([]json.RawMessage, len(args))
+	// Encode the arguments to JSON before opening the connection.
+	encodedArgs := make([]json.RawMessage, len(args)) // make makes slice (sth like a flexiable array) in argument length
 	for i, arg := range args {
 		data, err := json.Marshal(arg)
 		if err != nil {
@@ -400,7 +405,7 @@ func (c *Client) Call(method string, out any, args ...any) error {
 		return fmt.Errorf("set connection deadline: %w", err)
 	}
 
-	// Send exactly one JSON request.
+	// client Send exactly one JSON request. and server reads only one 
 	if _, err := conn.Write(append(requestData, '\n')); err != nil {
 		return fmt.Errorf("send request: %w", err)
 	}
